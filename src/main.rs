@@ -1,8 +1,12 @@
 use eframe::egui;
+use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::io::Write;
-use regex::Regex;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 
 #[cfg(target_os = "windows")]
 use winreg::enums::*;
@@ -30,6 +34,13 @@ impl SteamAccount {
     }
 }
 
+#[derive(Debug)]
+struct AccountUpdate {
+    id: String,
+    persona_name: Option<String>,
+    avatar_path: Option<PathBuf>,
+}
+
 struct DotaToolsApp {
     accounts: Vec<SteamAccount>,
     selected_source_idx: Option<usize>,
@@ -38,6 +49,7 @@ struct DotaToolsApp {
     target_search: String,
     status_message: String,
     steam_userdata_path: Option<PathBuf>,
+    account_updates_rx: Option<mpsc::Receiver<AccountUpdate>>,
     loading: bool,
 }
 
@@ -53,11 +65,15 @@ impl DotaToolsApp {
             target_search: String::new(),
             status_message: "Ready".to_owned(),
             steam_userdata_path: find_steam_userdata(),
+            account_updates_rx: None,
             loading: true,
         };
 
         if let Some(path) = &app.steam_userdata_path {
             app.accounts = get_accounts(path);
+            if !app.accounts.is_empty() {
+                app.spawn_account_updates();
+            }
         } else {
             app.status_message = "Steam userdata not found!".to_string();
         }
@@ -65,10 +81,93 @@ impl DotaToolsApp {
 
         app
     }
+
+    fn spawn_account_updates(&mut self) {
+        let accounts = self.accounts.clone();
+        let (tx, rx) = mpsc::channel();
+        self.account_updates_rx = Some(rx);
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build();
+            let Ok(rt) = rt else {
+                return;
+            };
+
+            rt.block_on(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(8))
+                    .build();
+                let Ok(client) = client else {
+                    return;
+                };
+
+                let cache_dir = avatar_cache_dir();
+                let _ = tokio::fs::create_dir_all(&cache_dir).await;
+
+                let mut join_set = JoinSet::new();
+                for account in accounts {
+                    let client = client.clone();
+                    let cache_dir = cache_dir.clone();
+                    join_set.spawn(async move {
+                        fetch_account_update(account, client, cache_dir).await
+                    });
+                }
+
+                while let Some(result) = join_set.join_next().await {
+                    if let Ok(Some(update)) = result {
+                        let _ = tx.send(update);
+                    }
+                }
+            });
+        });
+    }
+
+    fn apply_account_updates(&mut self, ctx: &egui::Context) {
+        let mut updated = false;
+        let mut disconnected = false;
+
+        if let Some(rx) = self.account_updates_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(update) => {
+                        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == update.id) {
+                            if let Some(name) = update.persona_name {
+                                account.persona_name = name;
+                            }
+                            if let Some(path) = update.avatar_path {
+                                account.avatar_path = Some(path);
+                            }
+                            updated = true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if disconnected {
+            self.account_updates_rx = None;
+        }
+
+        if updated {
+            ctx.request_repaint();
+        }
+
+        if self.account_updates_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
 }
 
 impl eframe::App for DotaToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_account_updates(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Dota 2 Config Copier");
             ui.add_space(20.0);
@@ -256,9 +355,24 @@ fn find_steam_userdata() -> Option<PathBuf> {
     None
 }
 
+fn avatar_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dota_tools/avatars")
+}
+
+fn cached_avatar_path(cache_dir: &Path, account_id: &str) -> Option<PathBuf> {
+    let file_path = cache_dir.join(format!("{}.jpg", account_id));
+    if file_path.exists() {
+        Some(file_path)
+    } else {
+        None
+    }
+}
+
 fn get_accounts(userdata_path: &Path) -> Vec<SteamAccount> {
     let mut accounts = Vec::new();
-    let cache_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("dota_tools/avatars");
+    let cache_dir = avatar_cache_dir();
     fs::create_dir_all(&cache_dir).ok();
 
     if let Ok(entries) = fs::read_dir(userdata_path) {
@@ -269,17 +383,12 @@ fn get_accounts(userdata_path: &Path) -> Vec<SteamAccount> {
                         if name.chars().all(char::is_numeric) {
                             if name == "0" { continue; }
 
-                            let (persona_name, avatar_url) = get_account_info(userdata_path, &name);
-
-                            let mut avatar_path = None;
-                            if let Some(url) = avatar_url {
-                                if let Some(path) = download_avatar(&url, &name, &cache_dir) {
-                                    avatar_path = Some(path);
-                                }
-                            }
+                            let id = name;
+                            let persona_name = get_account_info_local(userdata_path, &id);
+                            let avatar_path = cached_avatar_path(&cache_dir, &id);
 
                             accounts.push(SteamAccount {
-                                id: name,
+                                id,
                                 persona_name,
                                 avatar_path,
                             });
@@ -289,11 +398,15 @@ fn get_accounts(userdata_path: &Path) -> Vec<SteamAccount> {
             }
         }
     }
-    accounts.sort_by(|a, b| a.persona_name.to_lowercase().cmp(&b.persona_name.to_lowercase()));
+    accounts.sort_by(|a, b| {
+        let a_key = if a.persona_name.is_empty() { &a.id } else { &a.persona_name };
+        let b_key = if b.persona_name.is_empty() { &b.id } else { &b.persona_name };
+        a_key.to_lowercase().cmp(&b_key.to_lowercase())
+    });
     accounts
 }
 
-fn get_account_info(userdata_path: &Path, account_id: &str) -> (String, Option<String>) {
+fn get_account_info_local(userdata_path: &Path, account_id: &str) -> String {
     let mut persona_name = String::new();
 
     let config_path = userdata_path.join(account_id).join("config/localconfig.vdf");
@@ -308,41 +421,51 @@ fn get_account_info(userdata_path: &Path, account_id: &str) -> (String, Option<S
         }
     }
 
-    let mut avatar_url = None;
-
-    if let Ok(id32) = account_id.parse::<u64>() {
-        let id64 = id32 + 76561197960265728;
-        let url = format!("https://steamcommunity.com/profiles/{}?xml=1", id64);
-
-        if let Ok(response) = reqwest::blocking::get(&url) {
-            if let Ok(text) = response.text() {
-                if persona_name.is_empty() {
-                    let re_name = Regex::new(r"<steamID><!\[CDATA\[(.*?)\]\]></steamID>").unwrap();
-                    if let Some(caps) = re_name.captures(&text) {
-                        if let Some(name) = caps.get(1) {
-                            persona_name = name.as_str().to_string();
-                        }
-                    }
-                }
-
-                let re_avatar = Regex::new(r"<avatarMedium><!\[CDATA\[(.*?)\]\]></avatarMedium>").unwrap();
-                if let Some(caps) = re_avatar.captures(&text) {
-                    if let Some(url) = caps.get(1) {
-                        avatar_url = Some(url.as_str().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if persona_name.is_empty() {
-        persona_name = account_id.to_string();
-    }
-
-    (persona_name, avatar_url)
+    persona_name
 }
 
-fn download_avatar(url: &str, account_id: &str, cache_dir: &Path) -> Option<PathBuf> {
+struct RemoteAccountInfo {
+    persona_name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+async fn fetch_remote_account_info(
+    client: &reqwest::Client,
+    account_id: &str,
+) -> Option<RemoteAccountInfo> {
+    let id32 = account_id.parse::<u64>().ok()?;
+    let id64 = id32 + 76561197960265728;
+    let url = format!("https://steamcommunity.com/profiles/{}?xml=1", id64);
+
+    let response = client.get(url).send().await.ok()?;
+    let response = response.error_for_status().ok()?;
+    let text = response.text().await.ok()?;
+
+    let re_name = Regex::new(r"<steamID><!\[CDATA\[(.*?)\]\]></steamID>").unwrap();
+    let re_avatar = Regex::new(r"<avatarMedium><!\[CDATA\[(.*?)\]\]></avatarMedium>").unwrap();
+
+    let persona_name = re_name
+        .captures(&text)
+        .and_then(|caps| caps.get(1))
+        .map(|name| name.as_str().to_string());
+
+    let avatar_url = re_avatar
+        .captures(&text)
+        .and_then(|caps| caps.get(1))
+        .map(|url| url.as_str().to_string());
+
+    Some(RemoteAccountInfo {
+        persona_name,
+        avatar_url,
+    })
+}
+
+async fn download_avatar_async(
+    client: &reqwest::Client,
+    url: &str,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Option<PathBuf> {
     let file_name = format!("{}.jpg", account_id);
     let file_path = cache_dir.join(file_name);
 
@@ -350,16 +473,65 @@ fn download_avatar(url: &str, account_id: &str, cache_dir: &Path) -> Option<Path
         return Some(file_path);
     }
 
-    if let Ok(response) = reqwest::blocking::get(url) {
-        if let Ok(bytes) = response.bytes() {
-            if let Ok(mut file) = fs::File::create(&file_path) {
-                if file.write_all(&bytes).is_ok() {
-                    return Some(file_path);
-                }
+    let response = client.get(url).send().await.ok()?;
+    let response = response.error_for_status().ok()?;
+    let bytes = response.bytes().await.ok()?;
+
+    if let Ok(mut file) = tokio::fs::File::create(&file_path).await {
+        if file.write_all(&bytes).await.is_ok() {
+            return Some(file_path);
+        }
+    }
+
+    None
+}
+
+async fn fetch_account_update(
+    account: SteamAccount,
+    client: reqwest::Client,
+    cache_dir: PathBuf,
+) -> Option<AccountUpdate> {
+    let SteamAccount {
+        id,
+        persona_name,
+        avatar_path,
+    } = account;
+
+    let needs_name = persona_name.is_empty();
+    let needs_avatar = avatar_path.is_none();
+    if !needs_name && !needs_avatar {
+        return None;
+    }
+
+    let remote = fetch_remote_account_info(&client, &id).await?;
+
+    let mut update = AccountUpdate {
+        id,
+        persona_name: None,
+        avatar_path: None,
+    };
+
+    if needs_name {
+        if let Some(name) = remote.persona_name {
+            if !name.is_empty() {
+                update.persona_name = Some(name);
             }
         }
     }
-    None
+
+    if needs_avatar {
+        if let Some(url) = remote.avatar_url {
+            if let Some(path) = download_avatar_async(&client, &url, &update.id, &cache_dir).await {
+                update.avatar_path = Some(path);
+            }
+        }
+    }
+
+    if update.persona_name.is_none() && update.avatar_path.is_none() {
+        None
+    } else {
+        Some(update)
+    }
 }
 
 fn copy_dota_config(base_path: &Path, src_id: &str, target_id: &str) -> anyhow::Result<()> {
