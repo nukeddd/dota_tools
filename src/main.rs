@@ -298,7 +298,9 @@ impl eframe::App for DotaToolsApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 400.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([500.0, 400.0])
+            .with_app_id("dota_tools"),
         ..Default::default()
     };
     eframe::run_native(
