@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
 use regex::Regex;
 use std::fs;
@@ -138,6 +139,8 @@ fn collect_steam_library_roots(userdata_path: &Path) -> Vec<PathBuf> {
             "Games\\SteamLibrary",
         ];
 
+        let re_path = Regex::new(r#""path"\s+"([^"]+)""#).unwrap();
+
         for letter in b'A'..=b'Z' {
             let drive = format!("{}:\\", letter as char);
             let drive_path = PathBuf::from(&drive);
@@ -152,8 +155,7 @@ fn collect_steam_library_roots(userdata_path: &Path) -> Vec<PathBuf> {
                     // Also parse that library's libraryfolders.vdf
                     let vdf = candidate.join("steamapps").join("libraryfolders.vdf");
                     if let Ok(content) = fs::read_to_string(&vdf) {
-                        let re = Regex::new(r#""path"\s+"([^"]+)""#).unwrap();
-                        for caps in re.captures_iter(&content) {
+                        for caps in re_path.captures_iter(&content) {
                             if let Some(m) = caps.get(1) {
                                 let p = PathBuf::from(m.as_str());
                                 if p.exists() && !roots.contains(&p) {
@@ -252,6 +254,7 @@ struct DotaToolsApp {
     dota_cfg_path:       Option<PathBuf>,
     account_updates_rx:  Option<mpsc::Receiver<AccountUpdate>>,
     loading:             bool,
+    show_confirm_dialog: bool,
 }
 
 impl DotaToolsApp {
@@ -283,12 +286,19 @@ impl DotaToolsApp {
             dota_cfg_path,
             account_updates_rx:  None,
             loading:             true,
+            show_confirm_dialog: false,
         };
 
         if let Some(path) = &app.steam_userdata_path.clone() {
-            app.accounts = get_accounts(path, app.dota_cfg_path.as_deref());
+            let (accounts, last_id) = get_accounts(path, app.dota_cfg_path.as_deref());
+            app.accounts = accounts;
+            if let Some(id) = last_id {
+                if let Some(idx) = app.accounts.iter().position(|a| a.id == id) {
+                    app.selected_target_idx = Some(idx);
+                }
+            }
             if !app.accounts.is_empty() {
-                app.spawn_account_updates();
+                app.spawn_account_updates(false);
             }
         } else {
             app.status_message = "Steam userdata not found!".to_string();
@@ -297,7 +307,7 @@ impl DotaToolsApp {
         app
     }
 
-    fn spawn_account_updates(&mut self) {
+    fn spawn_account_updates(&mut self, force: bool) {
         let accounts = self.accounts.clone();
         let (tx, rx) = mpsc::channel();
         self.account_updates_rx = Some(rx);
@@ -322,7 +332,7 @@ impl DotaToolsApp {
                     let client    = client.clone();
                     let cache_dir = cache_dir.clone();
                     join_set.spawn(async move {
-                        fetch_account_update(account, client, cache_dir).await
+                        fetch_account_update(account, client, cache_dir, force).await
                     });
                 }
 
@@ -365,6 +375,29 @@ impl DotaToolsApp {
         if updated      { ctx.request_repaint(); }
         if self.account_updates_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn perform_copy(&mut self) {
+        match (self.selected_source_idx, self.selected_target_idx) {
+            (Some(si), Some(ti)) if si == ti => {
+                self.status_message = "⚠ Source and Target are the same account.".into();
+            }
+            (Some(si), Some(ti)) => {
+                let src_id   = self.accounts[si].id.clone();
+                let tgt_id   = self.accounts[ti].id.clone();
+                let src_name = self.accounts[si].persona_name.clone();
+                let tgt_name = self.accounts[ti].persona_name.clone();
+                if let Some(base) = &self.steam_userdata_path {
+                    match copy_dota_config(base, &src_id, &tgt_id) {
+                        Ok(_)  => self.status_message = format!("✓ Copied from {} → {}", src_name, tgt_name),
+                        Err(e) => self.status_message = format!("✗ Error: {}", e),
+                    }
+                }
+            }
+            _ => {
+                self.status_message = "Please select both Source and Target accounts.".into();
+            }
         }
     }
 }
@@ -615,6 +648,11 @@ impl eframe::App for DotaToolsApp {
                                 .size(11.0)
                                 .color(egui::Color32::GRAY),
                         );
+                    } else {
+                        ui.add_space(12.0);
+                        if ui.button("🔄 Refresh Avatars").clicked() {
+                            self.spawn_account_updates(true);
+                        }
                     }
                     if self.dota_cfg_path.is_none() {
                         ui.add_space(12.0);
@@ -637,30 +675,36 @@ impl eframe::App for DotaToolsApp {
             )
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    let btn = egui::Button::new(
-                        egui::RichText::new("  Copy Config  →  ").size(14.0).strong(),
-                    )
-                    .min_size(egui::vec2(180.0, 36.0))
-                    .fill(egui::Color32::from_rgb(80, 60, 180));
+                    if self.show_confirm_dialog {
+                        ui.label(egui::RichText::new("❓ Действительно скопировать?").color(egui::Color32::WHITE).strong());
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.available_width() / 2.0 - 50.0); // simple center
+                            if ui.button("Да").clicked() {
+                                self.perform_copy();
+                                self.show_confirm_dialog = false;
+                            }
+                            if ui.button("Отмена").clicked() {
+                                self.show_confirm_dialog = false;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("⚠ Убедитесь, что Dota 2 не запущена")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(220, 150, 50)),
+                        );
+                        ui.add_space(8.0);
+                        let btn = egui::Button::new(
+                            egui::RichText::new("  Copy Config  →  ").size(14.0).strong(),
+                        )
+                        .min_size(egui::vec2(180.0, 36.0))
+                        .fill(egui::Color32::from_rgb(80, 60, 180));
 
-                    if ui.add(btn).clicked() {
-                        match (self.selected_source_idx, self.selected_target_idx) {
-                            (Some(si), Some(ti)) if si == ti => {
-                                self.status_message = "⚠ Source and Target are the same account.".into();
-                            }
-                            (Some(si), Some(ti)) => {
-                                let src_id   = self.accounts[si].id.clone();
-                                let tgt_id   = self.accounts[ti].id.clone();
-                                let src_name = self.accounts[si].persona_name.clone();
-                                let tgt_name = self.accounts[ti].persona_name.clone();
-                                if let Some(base) = &self.steam_userdata_path {
-                                    match copy_dota_config(base, &src_id, &tgt_id) {
-                                        Ok(_)  => self.status_message = format!("✓ Copied from {} → {}", src_name, tgt_name),
-                                        Err(e) => self.status_message = format!("✗ Error: {}", e),
-                                    }
-                                }
-                            }
-                            _ => {
+                        if ui.add(btn).clicked() {
+                            if self.selected_source_idx.is_some() && self.selected_target_idx.is_some() {
+                                self.show_confirm_dialog = true;
+                            } else {
                                 self.status_message = "Please select both Source and Target accounts.".into();
                             }
                         }
@@ -673,6 +717,7 @@ impl eframe::App for DotaToolsApp {
                         .color(egui::Color32::from_rgb(160, 160, 180)),
                 );
             });
+
 
         // ── Central panel ─────────────────────────────────────────────────
         egui::CentralPanel::default()
@@ -818,8 +863,11 @@ fn no_conduct_notice(ui: &mut egui::Ui) {
 
 // ─── Account / path helpers ───────────────────────────────────────────────────
 
-fn get_accounts(userdata_path: &Path, dota_cfg: Option<&Path>) -> Vec<SteamAccount> {
+fn get_accounts(userdata_path: &Path, dota_cfg: Option<&Path>) -> (Vec<SteamAccount>, Option<String>) {
     let mut accounts = Vec::new();
+    let mut latest_id: Option<String> = None;
+    let mut latest_time: Option<std::time::SystemTime> = None;
+
     let cache_dir = avatar_cache_dir();
     fs::create_dir_all(&cache_dir).ok();
 
@@ -829,6 +877,14 @@ fn get_accounts(userdata_path: &Path, dota_cfg: Option<&Path>) -> Vec<SteamAccou
                 if ft.is_dir() {
                     if let Ok(name) = entry.file_name().into_string() {
                         if name.chars().all(char::is_numeric) && name != "0" {
+                            if let Ok(metadata) = entry.metadata() {
+                                if let Ok(modified) = metadata.modified() {
+                                    if latest_time.map_or(true, |t| modified > t) {
+                                        latest_time = Some(modified);
+                                        latest_id = Some(name.clone());
+                                    }
+                                }
+                            }
                             let id           = name;
                             let persona_name = get_account_info_local(userdata_path, &id);
                             let avatar_path  = cached_avatar_path(&cache_dir, &id);
@@ -847,7 +903,7 @@ fn get_accounts(userdata_path: &Path, dota_cfg: Option<&Path>) -> Vec<SteamAccou
         let bk = if b.persona_name.is_empty() { &b.id } else { &b.persona_name };
         ak.to_lowercase().cmp(&bk.to_lowercase())
     });
-    accounts
+    (accounts, latest_id)
 }
 
 fn get_account_info_local(userdata_path: &Path, account_id: &str) -> String {
@@ -915,8 +971,6 @@ fn cached_avatar_path(cache_dir: &Path, account_id: &str) -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-// ─── Remote fetch helpers ─────────────────────────────────────────────────────
-
 struct RemoteAccountInfo {
     persona_name: Option<String>,
     avatar_url:   Option<String>,
@@ -948,9 +1002,10 @@ async fn download_avatar_async(
     url:        &str,
     account_id: &str,
     cache_dir:  &Path,
+    force:      bool,
 ) -> Option<PathBuf> {
     let file_path = cache_dir.join(format!("{}.jpg", account_id));
-    if file_path.exists() { return Some(file_path); }
+    if !force && file_path.exists() { return Some(file_path); }
 
     let bytes = client.get(url).send().await.ok()?
         .error_for_status().ok()?
@@ -968,9 +1023,10 @@ async fn fetch_account_update(
     account:   SteamAccount,
     client:    reqwest::Client,
     cache_dir: PathBuf,
+    force:     bool,
 ) -> Option<AccountUpdate> {
     let needs_name   = account.persona_name.is_empty();
-    let needs_avatar = account.avatar_path.is_none();
+    let needs_avatar = account.avatar_path.is_none() || force;
     if !needs_name && !needs_avatar { return None; }
 
     let remote = fetch_remote_account_info(&client, &account.id).await?;
@@ -983,7 +1039,7 @@ async fn fetch_account_update(
     }
     if needs_avatar {
         if let Some(url) = remote.avatar_url {
-            update.avatar_path = download_avatar_async(&client, &url, &account.id, &cache_dir).await;
+            update.avatar_path = download_avatar_async(&client, &url, &account.id, &cache_dir, force).await;
         }
     }
 
@@ -992,25 +1048,53 @@ async fn fetch_account_update(
 
 // ─── Config copy ──────────────────────────────────────────────────────────────
 
-fn copy_dota_config(base_path: &Path, src_id: &str, target_id: &str) -> anyhow::Result<()> {
-    let src    = base_path.join(src_id).join("570/remote/cfg");
-    let target = base_path.join(target_id).join("570/remote/cfg");
 
-    if !src.exists() {
-        return Err(anyhow::anyhow!("Source config directory not found: {:?}", src));
-    }
-    if !target.exists() {
-        fs::create_dir_all(&target)?;
-    }
-
-    for entry in fs::read_dir(&src)? {
+fn copy_folder_contents(src: &Path, target: &Path) -> anyhow::Result<()> {
+    if !src.is_dir() { return Ok(()); }
+    
+    fs::create_dir_all(target)?;
+    
+    for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path  = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name() {
-                fs::copy(&path, target.join(name))?;
-            }
+        let name = path.file_name().ok_or_else(|| anyhow::anyhow!("No filename"))?;
+        let dest = target.join(name);
+        
+        if path.is_dir() {
+            copy_folder_contents(&path, &dest)?;
+        } else {
+            fs::copy(&path, &dest)?;
         }
+    }
+    Ok(())
+}
+
+fn copy_dota_config(base_path: &Path, src_id: &str, target_id: &str) -> anyhow::Result<()> {
+    let src_base = base_path.join(src_id);
+    let target_base = base_path.join(target_id);
+
+    let paths_to_copy = vec![
+        "570",
+        "config",
+        "ugc",
+        "ugcmsgcache",
+        "gamerecordings",
+        "inventorymsgcache"
+    ];
+
+    let mut success = false;
+    for rel_path in paths_to_copy {
+        let src = src_base.join(rel_path);
+        let target = target_base.join(rel_path);
+
+        if src.exists() {
+            copy_folder_contents(&src, &target)?;
+            success = true;
+        }
+    }
+    
+    if !success {
+        return Err(anyhow::anyhow!("No source directories found to copy."));
     }
     Ok(())
 }
